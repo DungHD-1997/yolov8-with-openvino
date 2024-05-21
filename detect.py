@@ -7,7 +7,7 @@ import cv2
 from pathlib import Path
 import random
 from PIL import Image
-
+import os
 def letterbox(img: np.ndarray, new_shape:Tuple[int, int] = (640, 640), color:Tuple[int, int, int] = (114, 114, 114), auto:bool = False, scale_fill:bool = False, scaleup:bool = False, stride:int = 32):
     """
     Resize image and padding for detection. Takes image as input, 
@@ -100,7 +100,7 @@ def postprocess(
     pred_boxes:np.ndarray,
     input_hw:Tuple[int, int],
     orig_img:np.ndarray,
-    min_conf_threshold:float = 0.25,
+    min_conf_threshold:float = 0.4,
     nms_iou_threshold:float = 0.7,
     agnosting_nms:bool = False,
     max_detections:int = 300,
@@ -129,7 +129,7 @@ def postprocess(
         torch.from_numpy(pred_boxes),
         min_conf_threshold,
         nms_iou_threshold,
-        nc=13,
+        nc=13, # number of classes when change your model
         **nms_kwargs
     )
     results = []
@@ -245,16 +245,70 @@ def draw_results(results:Dict, source_image:np.ndarray, label_map:Dict):
         source_image = plot_one_box(xyxy, source_image, mask=mask, label=label, color=colors(int(lbl)), line_thickness=1)
     return source_image
 
+def analys_results(results:Dict, source_image, label_map:Dict):
+    """
+    write result to .txt for annotation task
+    """
+    boxes = results["det"]
+    # masks = results.get("segment")
+    img_org = cv2.imread(img_path)
+    height, width, *_ = img_org.shape
+    for idx, (*xyxy, conf, lbl) in enumerate(boxes):
+        # label = f'{label_map[int(lbl)]} {conf:.2f}'
+        conf = float(conf)
+        if conf > 0.75:
+            # mask = masks[idx] if masks is not None else None
+            # c1, c2 = (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3]))
+            w = int(xyxy[2]) - int(xyxy[0])
+            h = int(xyxy[3]) - int(xyxy[1])
+
+            x_center = (int(xyxy[0]) + w/2)/width
+            y_center = (int(xyxy[1]) + h/2)/height
+
+            width_bbx = w/width
+            height_bbx = h/height
+
+            text_data = f"{int(lbl)} {round(x_center,6)} {round(y_center,6)} {round(width_bbx,6)} {round(height_bbx,6)}\n"
+            parent_path = Path(source_image).parent
+            img_file_name = Path(source_image).stem
+            save_path = os.path.join(parent_path,img_file_name +".txt")
+            f = open(save_path,"w")
+            f.write(text_data)
+            f.close()
+
+def analys_draw_boxes_img(results:Dict, source_image, label_map:Dict):
+    """
+    draw results on image
+    """
+    boxes = results["det"]
+    # h, w = source_image.shape[:2]
+    img_org = cv2.imread(source_image)
+    # height, width, *_ = img_org.shape
+    font = cv2.FONT_HERSHEY_SIMPLEX 
+    for idx, (*xyxy, conf, lbl) in enumerate(boxes):
+        # label = f'{label_map[int(lbl)]} {conf:.2f}'
+        conf = float(conf) # threshold for result detect, if conf > 0.75 -> truck
+        # if conf > 0.5:
+        parent_path = Path(source_image).parent
+        img_file_name = Path(source_image).stem
+        save_path_dir = os.path.join(parent_path,"results")
+        if not os.path.exists(save_path_dir):
+            os.makedirs(save_path_dir)
+        save_path = os.path.join(save_path_dir,img_file_name +".jpg")
+        img = cv2.rectangle(img_org, (int(xyxy[0]), int(xyxy[1])),(int(xyxy[2]), int(xyxy[3])),(255, 0, 0),2) #bgr
+        img = cv2.putText(img,f"{label_map[int(lbl)]} - {round(conf, 2)*100}",(int(int(xyxy[0]) + 5), int(int(xyxy[1]) + 20)), font, fontScale= 0.5, color= (0, 0, 255),thickness=1)
+        cv2.imwrite(save_path,img)
+
 from openvino.runtime import Core, Model
 import openvino as ov
 import ipywidgets as widgets
 core = Core()
-# device = widgets.Dropdown(
-#     options=core.available_devices + ["AUTO"],
-#     value='AUTO',
-#     description='Device:',
-#     disabled=False,
-# )
+device = widgets.Dropdown(
+    options=core.available_devices + ["AUTO"],
+    value='AUTO',
+    description='Device:',
+    disabled=False,
+)
 import yaml
 def read_config_model(path_yaml):
     with open(path_yaml) as stream:
@@ -264,7 +318,6 @@ def read_config_model(path_yaml):
             return data['names']
         except yaml.YAMLError as exc:
             print(exc)
-config_path = "C:/Project/result_train/yolov8/clean_data_obj/weights/best_openvino_model/metadata.yaml"            
 
 
 def detect(image:np.ndarray, model:Model):
@@ -288,28 +341,33 @@ def detect(image:np.ndarray, model:Model):
     detections = postprocess(pred_boxes=boxes, input_hw=input_hw, orig_img=image, pred_masks=masks)
     return detections
 
-det_model_path = "C:/Project/result_train/yolov8/clean_data_obj/weights/best_openvino_model/best.xml"
+config_path = "C:/Project/result_train/yolov8/train_normal_20/train_normal_20/weights/best_openvino_model/metadata.yaml"           
+det_model_path = "C:/Project/result_train/yolov8/train_normal_20/train_normal_20/weights/best_openvino_model/best.xml"
 det_ov_model = core.read_model(det_model_path)
-device = "CPU"  # "GPU"
-if device != "CPU":
+if device.value != "CPU":
     det_ov_model.reshape({0: [1, 3, 640, 640]})
-det_compiled_model = core.compile_model(det_ov_model, device)
+ov_config = {}
+if "GPU" in device.value or ("AUTO" in device.value and "GPU" in core.available_devices):
+    ov_config = {"GPU_DISABLE_WINOGRAD_CONVOLUTION": "YES"}
+det_compiled_model = core.compile_model(det_ov_model, device.value, ov_config)
 
-# if device.value != "CPU":
-#     det_ov_model.reshape({0: [1, 3, 640, 640]})
-# ov_config = {}
-# if "GPU" in device.value or ("AUTO" in device.value and "GPU" in core.available_devices):
-#     ov_config = {"GPU_DISABLE_WINOGRAD_CONVOLUTION": "YES"}
-
-det_compiled_model = core.compile_model(det_ov_model, device)
-
-IMAGE_PATH = "C:/Project/test_img_truck/image_2023-12-25_07z37z31.jpg"#"C:/Project/test_img_truck/image_2024-01-19_19z05z43.jpg"
-input_image = np.array(Image.open(IMAGE_PATH))
-detections = detect(input_image, det_compiled_model)[0]
-
+#IMAGE_PATH = "C:/Project/dataset/yolov5_train_data/data/add_data/SyncBase/truck_model_data/openvino_test/image_2024-05-15_00z04z27.jpg"#"C:/Project/test_img_truck/image_2024-01-19_19z05z43.jpg"
+dir = "C:/Project/result_train/yolov8/test_data/openvino"
+img_paths = list(Path(dir).glob("*.jpg"))
+import time
 label_map = read_config_model(path_yaml=config_path)
-image_with_boxes = draw_results(detections, input_image, label_map)
+for index in range(0,5):
+    start = time.time()
+    for img_path in img_paths:
+        input_image = np.array(Image.open(img_path))
+        detections = detect(input_image, det_compiled_model)[0]
 
-# img = 
-Image.fromarray(image_with_boxes).save("result01.jpg")
-# img.save("result.jpg")
+        # image_with_boxes = draw_results(detections, input_image, label_map)
+        
+        analys_draw_boxes_img(detections,img_path,label_map)
+    end = time.time() - start
+    print(f"time detect : {end}")
+
+    # img_rgb = image_with_boxes[:, :, ::-1]
+    # Image.fromarray(image_with_boxes).save(save_path)
+    # img.save("result.jpg")
